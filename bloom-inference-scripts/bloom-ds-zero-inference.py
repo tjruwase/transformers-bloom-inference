@@ -40,9 +40,11 @@ parser = ArgumentParser()
 parser.add_argument("--name", required=True, type=str, help="model_name")
 parser.add_argument("--local_rank", required=False, type=int, help="used by dist launchers")
 parser.add_argument("--batch_size", default=1, type=int, help="batch size")
+parser.add_argument("--loops", default=3, type=int, help="Number of iterations")
 parser.add_argument("--benchmark", action="store_true", help="additionally run benchmark")
 parser.add_argument("--cpu_offload", action="store_true", help="whether to activate CPU offload")
 parser.add_argument("--nvme_offload_path", help="whether to activate NVME offload and the path on nvme")
+parser.add_argument("--kv_offload", action="store_true", help="whether to offload KV cache to CPU")
 args = parser.parse_args()
 
 local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -130,7 +132,7 @@ print_rank0(ds_config)
 ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
 ds_engine.module.eval()
 model = ds_engine.module
-if args.cpu_offload:
+if args.cpu_offload and args.kv_offload:
     model.config.kv_offload = True
     model.config.max_new_tokens = num_tokens
 
@@ -238,9 +240,8 @@ if args.benchmark:
 
     # benchmark
     t0 = time.time()
-    cycles = 5
     total_new_tokens_generated = 0
-    for i in range(cycles):
+    for i in range(args.loops):
         generated = generate()
         total_new_tokens_generated += sum(new_tokens for _, _, new_tokens in generated)
 
