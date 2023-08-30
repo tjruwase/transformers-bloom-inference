@@ -29,6 +29,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.deepspeed import HfDeepSpeedConfig
 from transformers.models.bloom.modeling_bloom import BloomBlock as BloomBlock
 
+ENABLE_LLAMA_PADDING = True
 
 t_start = time.time()
 
@@ -60,10 +61,13 @@ def print_rank0(*msg):
 ### Model loading and instantiating on GPU (via ZeRO)
 
 model_name = args.name
-
+is_llama_model = model_name in ["meta-llama/Llama-2-70b-hf", "meta-llama/Llama-2-7b-hf"]
 print_rank0(f"*** Loading the model {model_name}")
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+if ENABLE_LLAMA_PADDING:
+    tokenizer.pad_token = tokenizer.eos_token
+
 config = AutoConfig.from_pretrained(model_name)
 
 # XXX: can't automatically derive dtype via config's `from_pretrained`
@@ -85,7 +89,7 @@ ds_config = {
         "contiguous_gradients": True,
         "reduce_bucket_size": model_hidden_size * model_hidden_size,
         "stage3_prefetch_bucket_size": 0.9 * model_hidden_size * model_hidden_size,
-        "stage3_param_persistence_threshold": 0,
+        "stage3_param_persistence_threshold": 2 * model_hidden_size, # 0,
     },
     "steps_per_print": 2000,
     "train_batch_size": train_batch_size,
@@ -126,6 +130,9 @@ print_rank0(ds_config)
 ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
 ds_engine.module.eval()
 model = ds_engine.module
+if args.cpu_offload:
+    model.config.kv_offload = True
+    model.config.max_new_tokens = num_tokens
 
 if args.benchmark:
     t_ready = time.time()
@@ -159,19 +166,44 @@ print_rank0(f"Generate args {generate_kwargs}")
 inputs = input_sentences[: args.batch_size]
 
 
-def generate():
+def generate(benchmarking=True):
     """returns a list of zipped inputs, outputs and number of new tokens"""
 
-    input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt", padding=True)
-    for t in input_tokens:
-        if torch.is_tensor(input_tokens[t]):
-            input_tokens[t] = input_tokens[t].to(torch.cuda.current_device())
+    def _llama_generate():
+        input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt")
+        for t in input_tokens:
+            if torch.is_tensor(input_tokens[t]):
+                input_tokens[t] = input_tokens[t].to(torch.cuda.current_device())
 
-    outputs = model.generate(**input_tokens, **generate_kwargs)
+        from transformers import LlamaTokenizerFast
+        if isinstance(tokenizer, LlamaTokenizerFast):
+            outputs = model.generate(input_tokens.input_ids, **generate_kwargs)
+        else:
+            outputs = model.generate(**input_tokens, **generate_kwargs)
+        
+        return input_tokens, outputs
+
+
+    def _model_generate():
+        # input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt", padding=True)
+        input_tokens = tokenizer.batch_encode_plus(inputs, return_tensors="pt", padding="max_length", max_length=512)
+        for t in input_tokens:
+            if torch.is_tensor(input_tokens[t]):
+                input_tokens[t] = input_tokens[t].to(torch.cuda.current_device())
+
+        outputs = model.generate(**input_tokens, **generate_kwargs)
+
+        return input_tokens, outputs
+
+    if is_llama_model and not ENABLE_LLAMA_PADDING:
+        input_tokens, outputs = _llama_generate()
+    else:
+        input_tokens, outputs = _model_generate()
 
     input_tokens_lengths = [x.shape[0] for x in input_tokens.input_ids]
     output_tokens_lengths = [x.shape[0] for x in outputs]
-
+    if not benchmarking:
+        print(f'{input_tokens_lengths=} {output_tokens_lengths=}')
     total_new_tokens = [o - i for i, o in zip(input_tokens_lengths, output_tokens_lengths)]
     outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
@@ -182,8 +214,9 @@ def generate():
 
 print_rank0("*** Running generate")
 t_generate_start = time.time()
-pairs = generate()
+pairs = generate(False)
 t_generate_span = time.time() - t_generate_start
+
 for i, o, _ in pairs:
     print_rank0(f"{'-'*60}\nin={i}\nout={o}\n")
 
@@ -218,6 +251,7 @@ if args.benchmark:
     print_rank0(
         f"""
 *** Performance stats:
+Tokens per second per GPU: {1.0/throughput:.2f}
 Throughput per token including tokenize: {throughput*1000:.2f} msecs
 Start to ready to generate: {t_ready - t_start:.3f} secs
 Tokenize and generate {total_new_tokens_generated} (bs={args.batch_size}) tokens: {t_generate_span:.3f} secs
