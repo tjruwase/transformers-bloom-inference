@@ -29,7 +29,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.deepspeed import HfDeepSpeedConfig
 from transformers.models.bloom.modeling_bloom import BloomBlock as BloomBlock
 
-ENABLE_LLAMA_PADDING = True
+ENABLE_LLAMA_PADDING = False
 
 t_start = time.time()
 
@@ -42,6 +42,7 @@ parser.add_argument("--local_rank", required=False, type=int, help="used by dist
 parser.add_argument("--batch_size", default=1, type=int, help="batch size")
 parser.add_argument("--loops", default=3, type=int, help="Number of iterations")
 parser.add_argument("--benchmark", action="store_true", help="additionally run benchmark")
+parser.add_argument("--use_local_path", action="store_true", help="Obtain model from local path")
 parser.add_argument("--cpu_offload", action="store_true", help="whether to activate CPU offload")
 parser.add_argument("--nvme_offload_path", help="whether to activate NVME offload and the path on nvme")
 parser.add_argument("--kv_offload", action="store_true", help="whether to offload KV cache to CPU")
@@ -63,14 +64,18 @@ def print_rank0(*msg):
 ### Model loading and instantiating on GPU (via ZeRO)
 
 model_name = args.name
-is_llama_model = model_name in ["meta-llama/Llama-2-70b-hf", "meta-llama/Llama-2-7b-hf"]
+if args.use_local_path:
+    is_llama_model = "llama-2" in model_name.lower():
+else:
+    is_llama_model = model_name in ["meta-llama/Llama-2-70b-hf", "meta-llama/Llama-2-7b-hf"]
 print_rank0(f"*** Loading the model {model_name}")
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=args.use_local_path)
+
 if ENABLE_LLAMA_PADDING:
     tokenizer.pad_token = tokenizer.eos_token
 
-config = AutoConfig.from_pretrained(model_name)
+config = AutoConfig.from_pretrained(model_name, local_files_only=args.use_local_path)
 
 # XXX: can't automatically derive dtype via config's `from_pretrained`
 dtype = torch.bfloat16 if model_name in ["bigscience/bloom", "bigscience/bigscience-small-testing"] else torch.float16
@@ -120,7 +125,7 @@ if args.benchmark:
     gc.collect()
     deepspeed.runtime.utils.see_memory_usage("pre-from-pretrained", force=True)
 
-model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(model_name, local_files_only=args.use_local_path, torch_dtype=torch.bfloat16)
 
 if args.benchmark:
     deepspeed.runtime.utils.see_memory_usage("post-from-pretrained", force=True)
@@ -146,6 +151,7 @@ if args.benchmark:
 print_rank0(f"*** Starting to generate {num_tokens} tokens with bs={args.batch_size}")
 
 input_sentences = [
+    "Paris is the capital city of",    
     "DeepSpeed is a machine learning framework",
     "He is working on",
     "He has a",
@@ -192,7 +198,7 @@ def generate(benchmarking=True):
         for t in input_tokens:
             if torch.is_tensor(input_tokens[t]):
                 input_tokens[t] = input_tokens[t].to(torch.cuda.current_device())
-
+        
         outputs = model.generate(**input_tokens, **generate_kwargs)
 
         return input_tokens, outputs
